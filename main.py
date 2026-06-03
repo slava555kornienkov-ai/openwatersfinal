@@ -1,14 +1,11 @@
 """
 Open Waters - Telegram Verification Backend
-With optional MOCK mode for frontend testing.
-Set MOCK_MODE=true to enable test codes (code: 12345)
+Uses StringSession for persistence across restarts
 """
 
 import os
 import asyncio
 import traceback
-import re
-import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
@@ -31,11 +28,10 @@ API_ID = int(os.getenv("API_ID", str(TEST_API_ID)))
 API_HASH = os.getenv("API_HASH", TEST_API_HASH)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 PORT = int(os.getenv("PORT", "8000"))
-MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
+_pending_codes: Dict[str, dict] = {}
 _rate_limits: Dict[str, list] = {}
 _auth_state = {"authorized": False, "phone": None}
-_test_codes: Dict[str, str] = {}
 
 
 def check_rate_limit(ip: str) -> bool:
@@ -49,8 +45,28 @@ def check_rate_limit(ip: str) -> bool:
     return True
 
 
+# Use StringSession for Railway persistence via env var
 admin_client: Optional[TelegramClient] = None
 admin_lock = asyncio.Lock()
+
+
+def _get_session() -> StringSession:
+    """Get session from env var or create empty one."""
+    session_str = os.getenv("SESSION_STRING", "")
+    if session_str:
+        try:
+            return StringSession(session_str)
+        except Exception:
+            pass
+    return StringSession()
+
+
+def _save_session(client: TelegramClient) -> Optional[str]:
+    """Save session string to return for env var setup."""
+    try:
+        return client.session.save()
+    except Exception:
+        return None
 
 
 async def get_admin_client() -> TelegramClient:
@@ -58,23 +74,11 @@ async def get_admin_client() -> TelegramClient:
     if admin_client is None:
         async with admin_lock:
             if admin_client is None:
-                admin_client = TelegramClient("/tmp/admin_session", API_ID, API_HASH)
+                session = _get_session()
+                admin_client = TelegramClient(session, API_ID, API_HASH)
     if not admin_client.is_connected():
-n        await admin_client.connect()
+        await admin_client.connect()
     return admin_client
-
-
-def handle_telegram_error(e: Exception) -> str:
-    err_str = str(e)
-    if "all available options" in err_str or "already used" in err_str or "ResendCodeRequest" in err_str:
-        return "Слишком большая активность. Попробуйте снова через 5 минут."
-    if "FLOOD_WAIT" in err_str or "flood" in err_str.lower():
-        match = re.search(r'(\d+)', err_str)
-        if match:
-            wait_min = max(1, round(int(match.group(1)) / 60))
-            return f"Слишком большая активность. Попробуйте снова через {wait_min} мин."
-        return "Слишком большая активность. Попробуйте снова через 5 минут."
-    return str(e)
 
 
 app = FastAPI(title="Open Waters - Telegram Verification")
@@ -90,13 +94,16 @@ app.add_middleware(
 class SendCodeRequest(BaseModel):
     phone: str = Field(..., pattern=r"^\d{10,15}$")
 
+
 class VerifyCodeRequest(BaseModel):
     phone: str = Field(..., pattern=r"^\d{10,15}$")
     code: str = Field(..., pattern=r"^\d{4,6}$")
     phone_code_hash: str
 
+
 class AuthRequest(BaseModel):
     phone: str = Field(..., pattern=r"^\d{10,15}$")
+
 
 class AuthCodeRequest(BaseModel):
     code: str = Field(..., min_length=1)
@@ -104,7 +111,20 @@ class AuthCodeRequest(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "authorized": _auth_state["authorized"], "mock_mode": MOCK_MODE}
+    return {"status": "ok", "authorized": _auth_state["authorized"]}
+
+
+@app.get("/api/session")
+async def get_session():
+    """Get current session string for saving to env var."""
+    tg = await get_admin_client()
+    session_str = _save_session(tg)
+    return {
+        "authorized": _auth_state["authorized"],
+        "session_string": session_str,
+        "phone": _auth_state.get("phone"),
+    }
+
 
 @app.post("/api/auth/send-code")
 async def auth_send_code(data: AuthRequest):
@@ -115,19 +135,27 @@ async def auth_send_code(data: AuthRequest):
         _auth_state["phone_code_hash"] = result.phone_code_hash
         return {"success": True, "message": "Code sent"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=handle_telegram_error(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(data: AuthCodeRequest):
     try:
         tg = await get_admin_client()
-        await tg.sign_in(phone=_auth_state["phone"], code=data.code, phone_code_hash=_auth_state.get("phone_code_hash"))
+        await tg.sign_in(
+            phone=_auth_state["phone"],
+            code=data.code,
+            phone_code_hash=_auth_state.get("phone_code_hash"),
+        )
         _auth_state["authorized"] = True
-        return {"success": True, "message": "Admin authorized"}
+        # Return session string so user can save it to env
+        session_str = _save_session(tg)
+        return {"success": True, "message": "Admin authorized", "session_string": session_str}
     except SessionPasswordNeededError:
         return {"success": False, "needs_password": True}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=handle_telegram_error(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/api/auth/password")
 async def auth_password(data: dict):
@@ -135,60 +163,88 @@ async def auth_password(data: dict):
         tg = await get_admin_client()
         await tg.sign_in(password=data.get("password", ""))
         _auth_state["authorized"] = True
-        return {"success": True}
+        session_str = _save_session(tg)
+        return {"success": True, "session_string": session_str}
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Неверный пароль")
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/api/send-code")
 async def send_code(data: SendCodeRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(ip):
-        raise HTTPException(status_code=429, detail="Слишком большая активность. Попробуйте снова через 1 минуту.")
+        raise HTTPException(status_code=429, detail="Too many requests")
     if not _auth_state["authorized"]:
         raise HTTPException(status_code=503, detail="Admin not authorized")
-    if MOCK_MODE:
-        test_hash = hashlib.sha256(f"test{data.phone}{datetime.utcnow().timestamp()}".encode()).hexdigest()[:16]
-        _test_codes[data.phone] = test_hash
-        return {"success": True, "phone_code_hash": test_hash, "message": "TEST Code: 12345"}
     try:
         tg = await get_admin_client()
         result = await tg.send_code_request(data.phone)
-        return {"success": True, "phone_code_hash": result.phone_code_hash, "message": "Code sent"}
+        _pending_codes[data.phone] = {
+            "phone_code_hash": result.phone_code_hash,
+            "expires": datetime.utcnow() + timedelta(minutes=5),
+            "attempts": 0,
+        }
+        return {
+            "success": True,
+            "phone_code_hash": result.phone_code_hash,
+            "message": "Code sent via Telegram",
+        }
     except PhoneNumberInvalidError:
-        raise HTTPException(status_code=400, detail="Неверный номер телефона")
+        raise HTTPException(status_code=400, detail="Invalid phone number")
     except FloodWaitError as e:
-        raise HTTPException(status_code=429, detail=handle_telegram_error(e))
+        raise HTTPException(status_code=429, detail=f"Wait {e.seconds}s")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=handle_telegram_error(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/verify-code")
 async def verify_code(data: VerifyCodeRequest):
-    if MOCK_MODE:
-        if data.code == "12345":
-            return {"success": True, "verified": True, "message": "Номер подтверждён (TEST)"}
-        raise HTTPException(status_code=400, detail="Неверный код. Попробуйте 12345 (тест).")
+    """
+    Verify code with 1 attempt. Wrong code deletes pending entry.
+    """
+    stored = _pending_codes.get(data.phone)
+    if not stored or stored["expires"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Code expired")
+    if stored["phone_code_hash"] != data.phone_code_hash:
+        raise HTTPException(status_code=400, detail="Invalid session")
+
+    stored["attempts"] = (stored.get("attempts", 0) + 1)
+    if stored["attempts"] > 1:
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Too many attempts")
+
     temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await temp_client.connect()
-        await temp_client.sign_in(phone=data.phone, code=data.code, phone_code_hash=data.phone_code_hash)
+        await temp_client.sign_in(
+            phone=data.phone,
+            code=data.code,
+            phone_code_hash=data.phone_code_hash,
+        )
         try:
             await temp_client.log_out()
-        except:
+        except Exception:
             pass
-        return {"success": True, "verified": True, "message": "Номер подтверждён"}
+        del _pending_codes[data.phone]
+        return {"success": True, "verified": True, "message": "Phone verified"}
     except PhoneCodeInvalidError:
-        raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Invalid code. Request new code.")
     except PhoneCodeExpiredError:
-        raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Code expired. Request new code.")
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Invalid code. Request new code.")
     finally:
         await temp_client.disconnect()
 
+
 @app.get("/")
 async def root():
-    return {"message": "Open Waters API", "mock_mode": MOCK_MODE}
+    return {"message": "Open Waters Telegram Verification API", "docs": "/docs"}
+
 
 if __name__ == "__main__":
     import uvicorn
