@@ -5,6 +5,7 @@ Open Waters - Telegram Verification Backend
 import os
 import asyncio
 import traceback
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
@@ -60,12 +61,10 @@ async def get_admin_client() -> TelegramClient:
 
 
 def handle_telegram_error(e: Exception) -> str:
-    """Convert Telegram errors to Russian user-friendly messages."""
     err_str = str(e)
     if "all available options" in err_str or "already used" in err_str or "ResendCodeRequest" in err_str:
         return "Слишком большая активность. Попробуйте снова через 5 минут."
     if "FLOOD_WAIT" in err_str or "flood" in err_str.lower():
-        import re
         match = re.search(r'(\d+)', err_str)
         if match:
             wait_min = max(1, round(int(match.group(1)) / 60))
@@ -165,7 +164,6 @@ async def verify_code(data: VerifyCodeRequest):
         raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
     if stored["phone_code_hash"] != data.phone_code_hash:
         raise HTTPException(status_code=400, detail="Неверная сессия.")
-    
     temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await temp_client.connect()
