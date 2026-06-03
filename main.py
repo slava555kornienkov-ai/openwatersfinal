@@ -1,11 +1,14 @@
 """
 Open Waters - Telegram Verification Backend
+With optional MOCK mode for frontend testing.
+Set MOCK_MODE=true to enable test codes (code: 12345)
 """
 
 import os
 import asyncio
 import traceback
 import re
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
@@ -28,9 +31,11 @@ API_ID = int(os.getenv("API_ID", str(TEST_API_ID)))
 API_HASH = os.getenv("API_HASH", TEST_API_HASH)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 PORT = int(os.getenv("PORT", "8000"))
+MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
 _rate_limits: Dict[str, list] = {}
 _auth_state = {"authorized": False, "phone": None}
+_test_codes: Dict[str, str] = {}
 
 
 def check_rate_limit(ip: str) -> bool:
@@ -55,7 +60,7 @@ async def get_admin_client() -> TelegramClient:
             if admin_client is None:
                 admin_client = TelegramClient("/tmp/admin_session", API_ID, API_HASH)
     if not admin_client.is_connected():
-        await admin_client.connect()
+n        await admin_client.connect()
     return admin_client
 
 
@@ -99,7 +104,7 @@ class AuthCodeRequest(BaseModel):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "authorized": _auth_state["authorized"]}
+    return {"status": "ok", "authorized": _auth_state["authorized"], "mock_mode": MOCK_MODE}
 
 @app.post("/api/auth/send-code")
 async def auth_send_code(data: AuthRequest):
@@ -141,6 +146,10 @@ async def send_code(data: SendCodeRequest, request: Request):
         raise HTTPException(status_code=429, detail="Слишком большая активность. Попробуйте снова через 1 минуту.")
     if not _auth_state["authorized"]:
         raise HTTPException(status_code=503, detail="Admin not authorized")
+    if MOCK_MODE:
+        test_hash = hashlib.sha256(f"test{data.phone}{datetime.utcnow().timestamp()}".encode()).hexdigest()[:16]
+        _test_codes[data.phone] = test_hash
+        return {"success": True, "phone_code_hash": test_hash, "message": "TEST Code: 12345"}
     try:
         tg = await get_admin_client()
         result = await tg.send_code_request(data.phone)
@@ -154,6 +163,10 @@ async def send_code(data: SendCodeRequest, request: Request):
 
 @app.post("/api/verify-code")
 async def verify_code(data: VerifyCodeRequest):
+    if MOCK_MODE:
+        if data.code == "12345":
+            return {"success": True, "verified": True, "message": "Номер подтверждён (TEST)"}
+        raise HTTPException(status_code=400, detail="Неверный код. Попробуйте 12345 (тест).")
     temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await temp_client.connect()
@@ -175,7 +188,7 @@ async def verify_code(data: VerifyCodeRequest):
 
 @app.get("/")
 async def root():
-    return {"message": "Open Waters API"}
+    return {"message": "Open Waters API", "mock_mode": MOCK_MODE}
 
 if __name__ == "__main__":
     import uvicorn
