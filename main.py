@@ -29,7 +29,6 @@ API_HASH = os.getenv("API_HASH", TEST_API_HASH)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 PORT = int(os.getenv("PORT", "8000"))
 
-_pending_codes: Dict[str, dict] = {}
 _rate_limits: Dict[str, list] = {}
 _auth_state = {"authorized": False, "phone": None}
 
@@ -145,10 +144,6 @@ async def send_code(data: SendCodeRequest, request: Request):
     try:
         tg = await get_admin_client()
         result = await tg.send_code_request(data.phone)
-        _pending_codes[data.phone] = {
-            "phone_code_hash": result.phone_code_hash,
-            "expires": datetime.utcnow() + timedelta(minutes=5),
-        }
         return {"success": True, "phone_code_hash": result.phone_code_hash, "message": "Code sent"}
     except PhoneNumberInvalidError:
         raise HTTPException(status_code=400, detail="Неверный номер телефона")
@@ -159,11 +154,6 @@ async def send_code(data: SendCodeRequest, request: Request):
 
 @app.post("/api/verify-code")
 async def verify_code(data: VerifyCodeRequest):
-    stored = _pending_codes.get(data.phone)
-    if not stored or stored["expires"] < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
-    if stored["phone_code_hash"] != data.phone_code_hash:
-        raise HTTPException(status_code=400, detail="Неверная сессия.")
     temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await temp_client.connect()
@@ -172,17 +162,13 @@ async def verify_code(data: VerifyCodeRequest):
             await temp_client.log_out()
         except:
             pass
-        del _pending_codes[data.phone]
         return {"success": True, "verified": True, "message": "Номер подтверждён"}
     except PhoneCodeInvalidError:
-        del _pending_codes[data.phone]
         raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
     except PhoneCodeExpiredError:
-        del _pending_codes[data.phone]
         raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
     except Exception as e:
         traceback.print_exc()
-        del _pending_codes[data.phone]
         raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
     finally:
         await temp_client.disconnect()
