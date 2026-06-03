@@ -59,6 +59,21 @@ async def get_admin_client() -> TelegramClient:
     return admin_client
 
 
+def handle_telegram_error(e: Exception) -> str:
+    """Convert Telegram errors to Russian user-friendly messages."""
+    err_str = str(e)
+    if "all available options" in err_str or "already used" in err_str or "ResendCodeRequest" in err_str:
+        return "Слишком большая активность. Попробуйте снова через 5 минут."
+    if "FLOOD_WAIT" in err_str or "flood" in err_str.lower():
+        import re
+        match = re.search(r'(\d+)', err_str)
+        if match:
+            wait_min = max(1, round(int(match.group(1)) / 60))
+            return f"Слишком большая активность. Попробуйте снова через {wait_min} мин."
+        return "Слишком большая активность. Попробуйте снова через 5 минут."
+    return str(e)
+
+
 app = FastAPI(title="Open Waters - Telegram Verification")
 app.add_middleware(
     CORSMiddleware,
@@ -97,7 +112,7 @@ async def auth_send_code(data: AuthRequest):
         _auth_state["phone_code_hash"] = result.phone_code_hash
         return {"success": True, "message": "Code sent"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=handle_telegram_error(e))
 
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(data: AuthCodeRequest):
@@ -109,7 +124,7 @@ async def auth_verify_code(data: AuthCodeRequest):
     except SessionPasswordNeededError:
         return {"success": False, "needs_password": True}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=handle_telegram_error(e))
 
 @app.post("/api/auth/password")
 async def auth_password(data: dict):
@@ -119,7 +134,7 @@ async def auth_password(data: dict):
         _auth_state["authorized"] = True
         return {"success": True}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Неверный пароль")
 
 @app.post("/api/send-code")
 async def send_code(data: SendCodeRequest, request: Request):
@@ -139,13 +154,9 @@ async def send_code(data: SendCodeRequest, request: Request):
     except PhoneNumberInvalidError:
         raise HTTPException(status_code=400, detail="Неверный номер телефона")
     except FloodWaitError as e:
-        wait_min = max(1, round(e.seconds / 60))
-        raise HTTPException(status_code=429, detail=f"Слишком большая активность. Попробуйте снова через {wait_min} мин.")
+        raise HTTPException(status_code=429, detail=handle_telegram_error(e))
     except Exception as e:
-        err_str = str(e)
-        if "all available options" in err_str or "already used" in err_str or "ResendCodeRequest" in err_str:
-            raise HTTPException(status_code=429, detail="Слишком большая активность. Попробуйте снова через 5 минут.")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=handle_telegram_error(e))
 
 @app.post("/api/verify-code")
 async def verify_code(data: VerifyCodeRequest):
