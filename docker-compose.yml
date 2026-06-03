@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - REDIS_URL=${REDIS_URL:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - PORT=8000
+    volumes:
+      - ./session:/app/sessions
+    restart: unless-stopped
+    # Optional: Redis for production
+    # depends_on:
+    #   - redis
+
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   volumes:
+  #     - redis_data:/data
+
+# volumes:
+#   redis_data:
