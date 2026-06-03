@@ -142,6 +142,9 @@ async def send_code(data: SendCodeRequest, request: Request):
         wait_min = max(1, round(e.seconds / 60))
         raise HTTPException(status_code=429, detail=f"Слишком большая активность. Попробуйте снова через {wait_min} мин.")
     except Exception as e:
+        err_str = str(e)
+        if "all available options" in err_str or "already used" in err_str or "ResendCodeRequest" in err_str:
+            raise HTTPException(status_code=429, detail="Слишком большая активность. Попробуйте снова через 5 минут.")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/verify-code")
