@@ -59,28 +59,6 @@ async def get_admin_client() -> TelegramClient:
     return admin_client
 
 
-async def verify_code_telegram(phone: str, code: str, phone_code_hash: str) -> bool:
-    temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
-    try:
-        await temp_client.connect()
-        await temp_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-        try:
-            await temp_client.log_out()
-        except:
-            pass
-        return True
-    except PhoneCodeInvalidError:
-        return False
-    except PhoneCodeExpiredError:
-        return False
-    except Exception as e:
-        print(f"[Verify Error] {e}")
-        traceback.print_exc()
-        return False
-    finally:
-        await temp_client.disconnect()
-
-
 app = FastAPI(title="Open Waters - Telegram Verification")
 app.add_middleware(
     CORSMiddleware,
@@ -110,7 +88,6 @@ class AuthCodeRequest(BaseModel):
 async def health():
     return {"status": "ok", "authorized": _auth_state["authorized"]}
 
-
 @app.post("/api/auth/send-code")
 async def auth_send_code(data: AuthRequest):
     try:
@@ -122,16 +99,11 @@ async def auth_send_code(data: AuthRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/auth/verify-code")
 async def auth_verify_code(data: AuthCodeRequest):
     try:
         tg = await get_admin_client()
-        await tg.sign_in(
-            phone=_auth_state["phone"],
-            code=data.code,
-            phone_code_hash=_auth_state.get("phone_code_hash"),
-        )
+        await tg.sign_in(phone=_auth_state["phone"], code=data.code, phone_code_hash=_auth_state.get("phone_code_hash"))
         _auth_state["authorized"] = True
         return {"success": True, "message": "Admin authorized"}
     except SessionPasswordNeededError:
@@ -139,12 +111,21 @@ async def auth_verify_code(data: AuthCodeRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/api/auth/password")
+async def auth_password(data: dict):
+    try:
+        tg = await get_admin_client()
+        await tg.sign_in(password=data.get("password", ""))
+        _auth_state["authorized"] = True
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/send-code")
 async def send_code(data: SendCodeRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(ip):
-        raise HTTPException(status_code=429, detail="Too many requests")
+        raise HTTPException(status_code=429, detail="Слишком большая активность. Попробуйте снова через 1 минуту.")
     if not _auth_state["authorized"]:
         raise HTTPException(status_code=503, detail="Admin not authorized")
     try:
@@ -153,47 +134,51 @@ async def send_code(data: SendCodeRequest, request: Request):
         _pending_codes[data.phone] = {
             "phone_code_hash": result.phone_code_hash,
             "expires": datetime.utcnow() + timedelta(minutes=5),
-            "attempts": 0,
         }
-        return {
-            "success": True,
-            "phone_code_hash": result.phone_code_hash,
-            "message": "Code sent",
-        }
+        return {"success": True, "phone_code_hash": result.phone_code_hash, "message": "Code sent"}
     except PhoneNumberInvalidError:
-        raise HTTPException(status_code=400, detail="Invalid phone number")
+        raise HTTPException(status_code=400, detail="Неверный номер телефона")
     except FloodWaitError as e:
-        raise HTTPException(status_code=429, detail=f"Wait {e.seconds}s")
+        wait_min = max(1, round(e.seconds / 60))
+        raise HTTPException(status_code=429, detail=f"Слишком большая активность. Попробуйте снова через {wait_min} мин.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/verify-code")
 async def verify_code(data: VerifyCodeRequest):
     stored = _pending_codes.get(data.phone)
     if not stored or stored["expires"] < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Code expired")
+        raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
     if stored["phone_code_hash"] != data.phone_code_hash:
-        raise HTTPException(status_code=400, detail="Invalid session")
-    stored["attempts"] = stored.get("attempts", 0) + 1
-    if stored["attempts"] > 3:
+        raise HTTPException(status_code=400, detail="Неверная сессия.")
+    
+    temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+    try:
+        await temp_client.connect()
+        await temp_client.sign_in(phone=data.phone, code=data.code, phone_code_hash=data.phone_code_hash)
+        try:
+            await temp_client.log_out()
+        except:
+            pass
         del _pending_codes[data.phone]
-        raise HTTPException(status_code=400, detail="Too many attempts")
-    is_valid = await verify_code_telegram(data.phone, data.code, data.phone_code_hash)
-    if is_valid:
+        return {"success": True, "verified": True, "message": "Номер подтверждён"}
+    except PhoneCodeInvalidError:
         del _pending_codes[data.phone]
-        return {"success": True, "verified": True, "message": "Verified"}
-    else:
-        remaining = 3 - stored["attempts"]
-        raise HTTPException(status_code=400, detail=f"Invalid code. {remaining} left")
-
+        raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
+    except PhoneCodeExpiredError:
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Код истёк. Запросите новый.")
+    except Exception as e:
+        traceback.print_exc()
+        del _pending_codes[data.phone]
+        raise HTTPException(status_code=400, detail="Неверный код. Запросите новый.")
+    finally:
+        await temp_client.disconnect()
 
 @app.get("/")
 async def root():
     return {"message": "Open Waters API"}
 
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
-
